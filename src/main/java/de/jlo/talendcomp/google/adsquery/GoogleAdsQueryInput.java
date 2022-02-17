@@ -1,3 +1,18 @@
+/**
+ * Copyright 2022 Jan Lolling jan.lolling@gmail.com
+ * 
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package de.jlo.talendcomp.google.adsquery;
 
 import java.awt.Desktop;
@@ -17,6 +32,8 @@ import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -24,23 +41,37 @@ import java.util.regex.Pattern;
 import com.google.ads.googleads.lib.GoogleAdsClient;
 import com.google.ads.googleads.lib.GoogleAdsClient.Builder;
 import com.google.ads.googleads.lib.GoogleAdsClient.Builder.ConfigPropertyKey;
+import com.google.ads.googleads.v10.services.CustomerServiceClient;
+import com.google.ads.googleads.v10.services.GoogleAdsRow;
+import com.google.ads.googleads.v10.services.GoogleAdsServiceClient;
+import com.google.ads.googleads.v10.services.ListAccessibleCustomersRequest;
+import com.google.ads.googleads.v10.services.ListAccessibleCustomersResponse;
+import com.google.ads.googleads.v10.services.SearchGoogleAdsStreamRequest;
+import com.google.ads.googleads.v10.services.SearchGoogleAdsStreamResponse;
 import com.google.api.client.http.GenericUrl;
 import com.google.api.client.http.HttpStatusCodes;
 import com.google.api.client.util.Key;
-import com.google.common.base.Strings;
+import com.google.api.gax.rpc.ServerStream;
 import com.google.auth.oauth2.ClientId;
 import com.google.auth.oauth2.UserAuthorizer;
 import com.google.auth.oauth2.UserCredentials;
 import com.google.common.base.MoreObjects;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 
+/**
+ * This is a wrapper around the Google Ads API
+ * @author jan.lolling@gmail.com
+ *
+ */
 public class GoogleAdsQueryInput {
 
 	private static final ImmutableList<String> SCOPES = ImmutableList.<String>builder()
 			.add("https://www.googleapis.com/auth/adwords").build();
 	private static final String OAUTH2_CALLBACK = "/oauth2callback";
-	private GoogleAdsClient adsClient = null;
+	private GoogleAdsClient googleAdsClient = null;
 	private Properties adsProperties = new Properties();
+	private Long customerId = null;
 
 	public void setupAdsPropertiesFromFile(String propFilePath) throws Exception {
 		File f = new File(propFilePath);
@@ -52,7 +83,6 @@ public class GoogleAdsQueryInput {
 		} catch (Exception e) {
 			throw new Exception("Load auth properties from file: " + f.getAbsolutePath() + " failed.", e);
 		}
-		checkAndCompleteAdsProperties();
 		if (checkAndCompleteAdsProperties()) {
 			// returns true if write back is needed
 			writeAdsProperties(f);
@@ -61,28 +91,31 @@ public class GoogleAdsQueryInput {
 	
 	private boolean checkAndCompleteAdsProperties() throws Exception {
 		if (checkIfUseServiceAccount()) {
-			System.out.println("Check properties for completeness for service account");
+			System.out.println("Check properties for completeness for service account...");
 			checkStaticServiceAccountPropertiesKeys();
 		} else {
-			System.out.println("Check properties for completeness for user account");
-			checkStaticUserPropertiesKeys();
+			System.out.println("Check properties for completeness for clientId account...");
+			checkStaticClientIdPropertiesKeys();
 			// after that we have to get the refresh token.
 			if (hasRefreshToken() == false) {
 				// we need to get the refresh token, this means user interaction!
+				System.out.println("Start fetching refresh token");
 				fetchFreshToken();
 				return true; // we have received a token and need to write it back
 			}
 		}
-		return false;
+		return false; // we do not need to write the properties back
 	}
 	
 	private void writeAdsProperties(File propFile) throws Exception {
+		System.out.println("Start write back properties file: " + propFile.getAbsolutePath());
 		if (adsProperties.isEmpty()) {
 			throw new Exception("Ads-Properties are empty! This is an invalid state");
 		}
 		try (OutputStream out = new FileOutputStream(propFile)) {
 			adsProperties.store(out, "Written back because refresh token received");
 			out.flush();
+			System.out.println("Properties file written");
 		} catch (Exception e) {
 			throw new Exception("Failed to write ads-properties to file: " + propFile.getAbsolutePath(), e);
 		}
@@ -91,7 +124,7 @@ public class GoogleAdsQueryInput {
 	private boolean checkIfUseServiceAccount() throws Exception {
 		String clientId = adsProperties.getProperty(ConfigPropertyKey.CLIENT_ID.getPropertyKey());
 		if (clientId == null) {
-			// we did not found a clientID, klets check if we have a service account
+			// we did not found a clientID, lets check if we have a service account
 			String serviceAccount = adsProperties.getProperty(ConfigPropertyKey.SERVICE_ACCOUNT_USER.getPropertyKey());
 			if (serviceAccount == null) {
 				throw new Exception("Invalid properties found, neither properties for using clientId or service account found!");
@@ -103,7 +136,7 @@ public class GoogleAdsQueryInput {
 		}
 	}
 
-	private void checkStaticUserPropertiesKeys() throws Exception {
+	private void checkStaticClientIdPropertiesKeys() throws Exception {
 		String clientId = adsProperties.getProperty(ConfigPropertyKey.CLIENT_ID.getPropertyKey());
 		if (clientId == null) {
 			throw new Exception("Property: " + ConfigPropertyKey.CLIENT_ID.getPropertyKey() + " is missing");
@@ -150,11 +183,18 @@ public class GoogleAdsQueryInput {
 		AuthorizationResponse authorizationResponse = null;
 		System.out.println("Start Callback server on ....");
 		try (SimpleCallbackServer simpleCallbackServer = new SimpleCallbackServer()) {
-			userAuthorizer = UserAuthorizer.newBuilder().setClientId(ClientId.of(clientId, clientSecret))
-					.setScopes(SCOPES).setCallbackUri(URI.create(OAUTH2_CALLBACK)).build();
+			userAuthorizer = UserAuthorizer.newBuilder()
+								.setClientId(ClientId.of(clientId, clientSecret))
+								.setScopes(SCOPES)
+								.setCallbackUri(URI.create(OAUTH2_CALLBACK))
+								.build();
 			baseUri = URI.create("http://localhost:" + simpleCallbackServer.getLocalPort());
 			if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
-				Desktop.getDesktop().browse(userAuthorizer.getAuthorizationUrl(null, state, baseUri).toURI());
+				URI uri = userAuthorizer.getAuthorizationUrl(null, state, baseUri).toURI();
+				System.out.println("Start browser with uri=" + uri.toString());
+				Desktop.getDesktop().browse(uri);
+			} else {
+				throw new Exception("Not possible to start a browser");
 			}
 			System.out.println("Wait for receiving oauth2 callback...");
 			// Waits for the authorization code.
@@ -238,6 +278,7 @@ public class GoogleAdsQueryInput {
 			}
 			return socket;
 		}
+		
 	}
 
 	/**
@@ -275,6 +316,7 @@ public class GoogleAdsQueryInput {
 			return MoreObjects.toStringHelper(getClass()).add("code", code).add("error", error).add("state", state)
 					.toString();
 		}
+		
 	}
 
 	public void initiateClient() throws Exception {
@@ -283,8 +325,60 @@ public class GoogleAdsQueryInput {
 		}
 		Builder builder = GoogleAdsClient.newBuilder();
 		builder.fromProperties(adsProperties);
-		adsClient = builder.build();
-		System.out.println("Google Ads Client version: " + adsClient.getLatestVersion());
+		googleAdsClient = builder.build();
+		System.out.println("Google Ads Client version: " + googleAdsClient.getEndpoint());
+	}
+	
+	public List<String> listAccessibleCustomers() throws Exception {
+		List<String> customers = new ArrayList<>();
+		try (CustomerServiceClient customerService = googleAdsClient.getLatestVersion().createCustomerServiceClient()) {
+			ListAccessibleCustomersResponse response = customerService
+					.listAccessibleCustomers(ListAccessibleCustomersRequest.newBuilder().build());
+
+			System.out.printf("Total results: %d%n", response.getResourceNamesCount());
+			for (String customerResourceName : response.getResourceNamesList()) {
+				customers.add(customerResourceName);
+			}
+		}
+		return customers;
+	}
+
+	public List<String> listCampaings() throws Exception {
+		if (customerId == null) {
+			throw new IllegalStateException("CustomerId is not set");
+		}
+		List<String> result = new ArrayList<>();
+		try (GoogleAdsServiceClient googleAdsServiceClient = googleAdsClient.getLatestVersion()
+				.createGoogleAdsServiceClient()) {
+			String query = "SELECT campaign.id, campaign.name FROM campaign ORDER BY campaign.id";
+			// Constructs the SearchGoogleAdsStreamRequest.
+			SearchGoogleAdsStreamRequest request = SearchGoogleAdsStreamRequest.newBuilder()
+					.setCustomerId(Long.toString(customerId)).setQuery(query).build();
+
+			// Creates and issues a search Google Ads stream request that will retrieve all
+			// campaigns.
+			ServerStream<SearchGoogleAdsStreamResponse> stream = googleAdsServiceClient.searchStreamCallable()
+					.call(request);
+
+			// Iterates through and prints all of the results in the stream response.
+			for (SearchGoogleAdsStreamResponse response : stream) {
+				for (GoogleAdsRow googleAdsRow : response.getResultsList()) {
+					result.add(googleAdsRow.getCampaign().getId() + "/" + googleAdsRow.getCampaign().getName());
+				}
+			}
+		}
+		return result;
+	}
+	
+	public Long getCustomerId() {
+		return customerId;
+	}
+
+	public void setCustomerId(String customerId) {
+		if (customerId == null || customerId.trim().isEmpty()) {
+			throw new IllegalArgumentException("customerId cannot be null or empty");
+		}
+		this.customerId = Long.valueOf(customerId.replace("-", ""));
 	}
 
 }
